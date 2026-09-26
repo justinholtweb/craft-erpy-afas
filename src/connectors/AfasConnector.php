@@ -39,7 +39,8 @@ use justinholtweb\erpy\models\canonical\ErpStock;
  * corrects the connector's reading without touching code.
  *
  * Authentication is an App Connector token, which AFAS gives you as XML and expects back
- * base64-encoded inside an `AfasToken` header. Everyone gets that wrong once.
+ * base64-encoded in the standard `Authorization` header, after the scheme name `AfasToken`:
+ * `Authorization: AfasToken <base64 of the XML>`. Everyone gets that wrong once.
  */
 class AfasConnector extends Connector
 {
@@ -118,6 +119,10 @@ class AfasConnector extends Connector
             ]),
             Field::text('skuField', Craft::t('erpy', 'Item code field'), ['default' => 'Itemcode']),
             Field::text('customerCodeField', Craft::t('erpy', 'Customer number field'), ['default' => 'Debiteurnummer']),
+            Field::text('orderReferenceField', Craft::t('erpy', 'Order reference field'), [
+                'default' => 'Referentie',
+                'instructions' => Craft::t('erpy', 'The field on the sales orders GetConnector that holds the customer reference (RfCs), where Erpy writes the Commerce order number. Order status is matched on it, and it is checked before an order is created so a retry cannot post the same order twice.'),
+            ]),
 
             Field::heading(Craft::t('erpy', 'Sales orders')),
             Field::text('salesOrderConnector', Craft::t('erpy', 'UpdateConnector'), [
@@ -319,11 +324,13 @@ class AfasConnector extends Connector
 
     protected function fetchOrderStatuses(FetchCriteria $criteria): Page
     {
-        return $this->page((string)$this->setting('ordersConnector', 'Profit_Verkooporders'), $criteria, Entity::ORDER_STATUS, function(array $row): ErpOrderStatus {
+        $referenceField = (string)$this->setting('orderReferenceField', 'Referentie') ?: 'Referentie';
+
+        return $this->page((string)$this->setting('ordersConnector', 'Profit_Verkooporders'), $criteria, Entity::ORDER_STATUS, function(array $row) use ($referenceField): ErpOrderStatus {
             $status = (string)($row['Status'] ?? '');
 
             return new ErpOrderStatus([
-                'orderNumber' => (string)($row['Referentie'] ?? $row['Reference'] ?? ''),
+                'orderNumber' => (string)($row[$referenceField] ?? $row['Referentie'] ?? $row['Reference'] ?? ''),
                 'status' => $status,
                 'statusCode' => $status,
                 'isCancelled' => stripos($status, 'vervall') !== false || stripos($status, 'cancel') !== false,
@@ -348,6 +355,18 @@ class AfasConnector extends Connector
         }
 
         $connector = (string)$this->setting('salesOrderConnector', 'FbSales');
+        $reference = mb_substr($document->orderNumber, 0, 50);
+
+        // `RfCs` carries the Commerce order number, so a retried job asks the sales orders
+        // GetConnector before it creates rather than leaving two orders behind.
+        $existing = $this->findOrder($reference);
+
+        if ($existing !== null && $remoteId === null) {
+            $number = (string)($existing['Ordernummer'] ?? $existing['OrderNumber'] ?? '');
+
+            return PushResult::alreadyExists($number !== '' ? $number : $document->orderNumber, $number ?: null);
+        }
+
         $lines = [];
 
         foreach ($document->lines as $line) {
@@ -372,7 +391,7 @@ class AfasConnector extends Connector
                     'Fields' => array_filter([
                         'OrDa' => ($document->orderedAt ?? new DateTime())->format('Y-m-d'),
                         'DbId' => $document->customerCode,
-                        'RfCs' => mb_substr($document->orderNumber, 0, 50),
+                        'RfCs' => $reference,
                         'CuId' => $document->currency,
                         'Rm' => $document->customerNote ? mb_substr($document->customerNote, 0, 250) : null,
                         'War' => $this->setting('warehouse') ?: null,
@@ -401,6 +420,46 @@ class AfasConnector extends Connector
         $number = (string)($response->at('results.FbSales.OrNu') ?? $response->at('OrNu') ?? '');
 
         return PushResult::ok($number !== '' ? $number : $document->orderNumber, $number ?: null, $response->json_());
+    }
+
+    /**
+     * The sales order already carrying this customer reference, read from the sales orders
+     * GetConnector filtered on the reference field (operator 1, "equal to").
+     *
+     * Returned rows are checked against the reference as well, so a GetConnector that answers
+     * with something other than an exact match cannot mark an undelivered order as delivered. A
+     * lookup that cannot be made — no GetConnector configured, a field it does not expose (AFAS
+     * answers that with an error), a reference containing the comma the filter lists are split on
+     * — returns null and the order is created, which is what happened before the check existed.
+     */
+    private function findOrder(string $reference): ?array
+    {
+        $connector = (string)$this->setting('ordersConnector', 'Profit_Verkooporders');
+        $field = (string)$this->setting('orderReferenceField', 'Referentie') ?: 'Referentie';
+
+        if ($connector === '' || $reference === '' || str_contains($reference, ',')) {
+            return null;
+        }
+
+        $response = $this->transport()->get("connectors/$connector", [
+            'filterfieldids' => $field,
+            'filtervalues' => $reference,
+            'operatortypes' => '1',
+            'skip' => 0,
+            'take' => 10,
+        ]);
+
+        if (!$response->ok()) {
+            return null;
+        }
+
+        foreach ((array)$response->at('rows', []) as $row) {
+            if (is_array($row) && (string)($row[$field] ?? '') === $reference) {
+                return $row;
+            }
+        }
+
+        return null;
     }
 
     // ---------------------------------------------------------------------------------------
